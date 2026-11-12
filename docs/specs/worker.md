@@ -41,8 +41,8 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
 
 7. As a non-technical user, I want the Worker to check its tools before it starts, so that a missing tool does not fail halfway through my Inbox.
 8. As a non-technical user, I want to be asked once before anything is installed, with what will be installed and roughly how big it is, so that nothing large lands on my computer by surprise.
-9. As a Library owner, I want the first transcription to warn me that the speech model is downloaded once, so that a slow first run does not look broken.
-10. As a Library owner, I want Apple Silicon Macs to use Parakeet, with Whisper for languages Parakeet lacks, and other computers the portable Whisper, so that transcription is quick and does not invent words over music.
+9. As a Library owner, I want my speech-to-text API keys kept in a file on my computer, never in the Library or a chat, so that they stay private.
+10. As a Library owner, I want to choose Deepgram or OpenAI as the first speech-to-text provider, with the other as fallback, so that one provider's outage or a spent credit does not stop transcription. (Changed by [ADR 0005](../adr/0005-transcription-through-the-users-own-api-keys.md): this replaced the local Parakeet and Whisper engines.)
 
 ### Reading the post
 
@@ -108,17 +108,17 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
   - **Trigger:** the description gains one branch: the user names Graveyard Killer, for example to run its Worker. A bare "process my inbox" is ambiguous (it may mean email), so the request must name Graveyard Killer.
   - **Shared steps:** the job reuses "Find the Library" and "Read the Settings" as they are.
   - **Shell check:** the job needs a computer with a shell. On a surface without one, such as the phone app, the agent says that the Worker runs on the computer and stops.
-- **Agent and script split the work.** The agent does the Notion reads and writes, the duplicate checks and all the writing and judging (Title, Summary, Next action, Category, Tags, reading keyframes). The post script does everything that touches media. The agent never runs yt-dlp, gallery-dl, ffmpeg or Whisper directly.
+- **Agent and script split the work.** The agent does the Notion reads and writes, the duplicate checks and all the writing and judging (Title, Summary, Next action, Category, Tags, reading keyframes). The post script does everything that touches media. The agent never runs yt-dlp, gallery-dl, ffmpeg or the speech-to-text APIs directly.
 
 ### Tools
 
 - **The tools:**
   - yt-dlp and gallery-dl, as uv tools.
-  - On Apple Silicon: parakeet-mlx (Parakeet-TDT v3) and mlx-whisper, as uv tools. Elsewhere: whisper-ctranslate2 (built on faster-whisper).
   - ffmpeg from the system package manager.
-- **Checking them:** the post script has a `check` command. It lists what is missing, uv included, with the install command for this platform. It also says whether the speech model is downloaded yet, so the agent can warn before the first transcription.
-- **Asking first:** the agent asks once before installing anything. It names each tool and says the speech model downloads on first use, about 1.6 GB for the turbo model.
-- **The speech engine** is Parakeet-TDT v3 on Apple Silicon when the post's language is unknown or one of its 25 European languages, and Whisper turbo (large-v3-turbo) for any other language. Off Apple Silicon it is Whisper turbo alone. The language comes from the agent's hint or the platform's own metadata. Parakeet was chosen on 2026-10-25: the user's video-making work found it 5 to 10 times faster than Whisper with a lower error rate, and a Whisper warm-up on a 2-second tone with no speech wrote "Thank you."
+  - No speech model: speech-to-text is an API call ([ADR 0005](../adr/0005-transcription-through-the-users-own-api-keys.md)).
+- **Checking them:** the post script has a `check [--provider <name>]` command. It lists what is missing, uv included, with the install command for this platform. It reports which API keys are set (`keys`), the `keys_file` path, and `warnings` such as the chosen provider's key missing. No key at all counts as missing.
+- **Asking first:** the agent asks once before installing anything, and names each tool.
+- **The speech-to-text provider** is the Settings' Transcription Provider first, `deepgram` (nova-3, `smart_format`) or `openai` (gpt-4o-transcribe), and the other one when it fails or has no key. The audio goes as a 16 kHz mono mp3; OpenAI gets it in pieces of at most 10 minutes. The language hint is sent as its base code (`pt-BR` becomes `pt`); without one Deepgram detects the language, and a language Deepgram refuses is retried once with detection. Empty text is a result (music only), not a failure. The keys come from `DEEPGRAM_API_KEY` and `OPENAI_API_KEY` in the environment, else from `~/.config/graveyard-killer/keys.env` (`GK_KEYS_FILE` moves it). Errors name the HTTP status only, never the key.
 
 ### The post script
 
@@ -126,7 +126,7 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
 - It calls each tool as an outside program found on PATH, which is the seam the tests use. It imports the link script to make links canonical.
 - **Commands:**
   - `check`: reports missing tools as JSON.
-  - `read [<link>] [--language <code>]`: reads one post into a fresh temporary work folder and prints one JSON object. The agent passes the link on stdin through a quoted heredoc, so no shell ever expands it. Anything but an `http(s)://` link is refused before any tool runs, and every tool gets `--` before the link, so a "link" can never act as an option. `--language` passes a spoken-language hint to Whisper.
+  - `read [<link>] [--language <code>]`: reads one post into a fresh temporary work folder and prints one JSON object. The agent passes the link on stdin through a quoted heredoc, so no shell ever expands it. Anything but an `http(s)://` link is refused before any tool runs, and every tool gets `--` before the link, so a "link" can never act as an option. `--language` passes a spoken-language hint to the provider. `--provider` names the provider to try first.
   - `clean <folder>`: deletes a work folder. It refuses any folder that lacks the marker file that `read` creates.
 - **`read` output.** All paths point inside the work folder. The JSON object has:
   - `status`: `ok`, `unavailable`, `needs_login` or `error`
@@ -135,7 +135,7 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
   - `id`, `author`, `title`, `caption`
   - `kind`: `video` or `photos`
   - `duration`
-  - `transcript`, plus `transcript_source` (`captions`, `auto_captions`, `parakeet`, `whisper` or `none`) and `transcript_language`
+  - `transcript`, plus `transcript_source` (`captions`, `auto_captions`, `deepgram`, `openai` or `none`) and `transcript_language`
   - `work`: the work folder, for `clean`
   - `keyframes`: image paths
   - `thumbnail`: a JPEG path, kept under 5 MiB for Notion's Free plan
@@ -147,7 +147,8 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
   - The output keeps the yt-dlp metadata and gallery-dl's images.
 - **Transcript:**
   - The creator's captions are used when they exist, in the video's own language. Otherwise the original-language automatic captions are used (see the borrowed caption choice below).
-  - Otherwise speech-to-text runs on the audio, if there is audio: Parakeet or Whisper, as above.
+  - Otherwise speech-to-text runs on the audio, if there is audio: Deepgram or OpenAI, as above.
+  - When every provider fails, `read` gives `status: transcription_failed` with a `reason` and `blocked` (true when each failure was a missing key or HTTP 401, 402, 403 or 429, which the next run will not fix by itself). The Entry is not finished, so it never ends Processed without its transcript.
   - Photos get no transcript.
 - **Keyframes:**
   - For video: the first frame, plus scene-change frames, at most 8 in total, each scaled to at most 1024 px.
@@ -167,7 +168,7 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
 - **Downloads:** each run gets a fresh work folder. A partial download or a leftover merge file never counts as media. Both tools ignore the user's own config files, so no cookies or login stored there are used.
 - **Clean-up:** delete only the work folder that this run created, never its parent.
 - **On an HTTP 403 from yt-dlp:** update yt-dlp once (`uv tool upgrade yt-dlp`) and retry once before reporting the status. A login challenge is never retried, because ADR 0001 says to stop reading Instagram at the first challenge. Rotating clients or cookies is ruled out.
-- **Non-English speech:** pass the spoken language as a hint when the Entry's Caption is clearly in one language. It picks the engine, and Whisper also takes it as its language. The Settings language is the user's, not the video's, so it is never the hint. Otherwise Whisper detects the language itself. (claude-video's "unverified" label was for a WhisperX bug that turbo does not have.)
+- **Non-English speech:** pass the spoken language as a hint when the Entry's Caption is clearly in one language. The provider takes it as the spoken language. The Settings language is the user's, not the video's, so it is never the hint. Otherwise the provider detects the language itself.
 
 ### The run (the agent's steps)
 
@@ -229,10 +230,10 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
     - No work folder is left on disk after the run.
 - **Seam 2, the post script.**
   - It is built test first with pytest, and the tests call the script as the agent does.
-  - Fake `yt-dlp`, `gallery-dl`, Parakeet, Whisper and `uv` commands are placed first on PATH. They print stored JSON and copy small media files. Real `ffmpeg` and `ffprobe` run on short clips and images that the tests build, so the keyframe and thumbnail checks test real behaviour. No test needs the network. Without ffmpeg on the computer, the media tests skip.
+  - Fake `yt-dlp`, `gallery-dl` and `uv` commands are placed first on PATH, and a local HTTP server stands in for Deepgram and OpenAI. They print stored JSON and copy small media files. Real `ffmpeg` and `ffprobe` run on short clips and images that the tests build, so the keyframe and thumbnail checks test real behaviour. No test needs the network. Without ffmpeg on the computer, the media tests skip.
   - The cases:
-    - a video post with speech gives a Parakeet transcript on Apple Silicon, for an unknown language or one of Parakeet's, and a Whisper transcript for any other language or elsewhere;
-    - a YouTube video with creator captions gives `transcript_source: captions`, and Whisper is never called;
+    - a video post with speech goes to the chosen provider first, and to the other one when the first fails or has no key; failures on both give `transcription_failed`, `blocked` for key, credit and rate-limit errors;
+    - a YouTube video with creator captions gives `transcript_source: captions`, and no provider is called;
     - with no creator captions, the original-language automatic captions give `auto_captions`;
     - a short link's resolved `webpage_url` gives a canonical `link`;
     - a carousel falls back to gallery-dl, gives image keyframes and has no transcript;
@@ -247,7 +248,7 @@ This slice proves the Worker's hardest parts by hand: downloading, transcription
     - odd tool output gives `error`, never a traceback;
     - frames fit in a 1024 px square, tall slides included, and a clip with many scenes gives at most 8 distinct frames;
     - a photo post behind a short link gets its canonical link;
-    - `check` asks for uv and says whether the speech model is downloaded.
+    - `check` asks for uv and reports the API keys.
   - **The live test** is opt-in, behind a pytest marker. It runs the real tool chain on the public YouTube test video, with no Instagram.
 - **Prior art:**
   - The link script's tests already call a script as the agent does, with a subprocess, text in and JSON out.

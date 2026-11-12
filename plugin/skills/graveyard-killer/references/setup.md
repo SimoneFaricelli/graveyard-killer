@@ -13,13 +13,24 @@ Setup starts when the user asks to set up Graveyard Killer, or when a Graveyard 
 2. **Create the Library.** Check that your Notion connector works, for example by reading the user's Notion profile or searching. If it does not, ask the user to connect Notion first. Ask in one question what to call the Library, suggesting "Graveyard Killer" as a private page. Then create it exactly as [library.md](library.md) describes:
    - the private page with that name;
    - the Entries database inside it, with every field in the user's language, the six Statuses and the Category options;
-   - the `Settings` page, with every section. The Limits start at 20 per day and 100 per week. The Schedule and "Ping by" stay empty until steps 3 and 9.
+   - the `Settings` page, with every section. The Limits start at 20 per day and 100 per week. The Transcription Provider is `deepgram` until step 4. The Schedule and "Ping by" stay empty until steps 3 and 9.
 
    Done when you can read the Settings back.
 
 3. **Pick the time.** Ask at what time the Worker should run every day. Suggest a time when the computer is usually on and awake, such as lunchtime, and say that it runs only while the Claude app is open and the computer is awake. Write the answer in the Settings' Schedule section. Done when the Settings hold it.
 
-4. **Install the tools.** Follow step 1 of [worker.md](worker.md#steps). Done when `check` prints `"ok": true`.
+4. **Install the tools and add the speech-to-text keys.** Done when `check` prints `"ok": true` and `keys` is true for the provider they picked.
+   - Ask which provider should transcribe first, Deepgram or OpenAI; the other is the fallback when it fails. Write the answer to the Settings' Transcription Provider, `deepgram` or `openai`.
+   - Follow step 1 of [worker.md](worker.md#steps) for the tools.
+   - Run `python3 scripts/post.py check` and read its `keys_file`. If that file does not exist yet, create it with these two lines and nothing else, and on macOS and Linux run `chmod 600` on it:
+
+     ```
+     DEEPGRAM_API_KEY=
+     OPENAI_API_KEY=
+     ```
+
+   - Ask the user to open the file in a text editor and paste their key after the `=` of each provider they use, then save. Show them its full path. Never ask them to paste a key into the chat, and never put a key in a command: a key in the chat stays in its history. On a Mac, `open -e "<path>"` opens it in TextEdit; on Windows, `notepad "<path>"`.
+   - Run `check --provider <their provider>` again. If `keys` is still false, the line may be misspelled or the file saved elsewhere.
 
 5. **Test one link end to end.** Ask the user for the link of a public post they saved. Capture it as [capture.md](capture.md) says. Then finish only that Entry, as worker.md's [Each Entry](worker.md#each-entry) says, with no dig-up and no Ping. Show them the finished Entry. Done when it is Processed.
 

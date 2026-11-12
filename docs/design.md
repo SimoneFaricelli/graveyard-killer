@@ -14,7 +14,7 @@ This page records v1. Version 0.4.0 changes it after the launch feedback; where 
 
 ## Parts
 
-- **Plugin.** A Claude plugin marketplace with one plugin. Inside it is a standard Agent Skill: `SKILL.md` plus Python scripts. Both scripts, Capture's link script and the Worker's post script, use only the Python standard library and run with `python3`, so the link script also runs in a phone app's sandbox. The tools the post script calls (yt-dlp, gallery-dl, Whisper) are installed with uv. Everything is written in English, and the agent talks in the user's language.
+- **Plugin.** A Claude plugin marketplace with one plugin. Inside it is a standard Agent Skill: `SKILL.md` plus Python scripts. Both scripts, Capture's link script and the Worker's post script, use only the Python standard library and run with `python3`, so the link script also runs in a phone app's sandbox. The tools the post script calls (yt-dlp, gallery-dl) are installed with uv; speech goes to the user's Deepgram or OpenAI account. Everything is written in English, and the agent talks in the user's language.
 - **Library.** Notion, Google Sheets or a markdown folder, chosen at setup. Field names are in the user's language. The Library holds its own **Settings**: Categories and their fields, language, schedule. Markdown works from the computer only.
 - **Memory.** One line on each agent surface says where the Library is. In Claude the apps share one chat memory and the Code tab keeps its own. Setup writes the Code tab's and gives the user the message that saves the chat one, since a Code tab session cannot write chat memory. If the line is missing, the skill asks for the link once.
 - **Worker.** A local scheduled task in the Claude Desktop Code tab. It runs weekly by default (setup can change it), while the app is open and the computer is awake, and does one catch-up run after sleep. "Run the Graveyard Killer worker" runs it on demand.
@@ -24,7 +24,7 @@ This page records v1. Version 0.4.0 changes it after the launch feedback; where 
 1. **Capture, on the phone.** You share a link to the agent app. For TikTok, YouTube and other links, the agent reads a preview from public pages, then files an Entry in the Inbox with a first Category, summary and Next action. For Instagram it files the link only, because Instagram refuses agent fetches and its embed page no longer carries the caption. The Worker fills in the rest. The same link twice stays one Entry, and the second capture is noted.
 2. **Worker run, weekly.**
    - Download: yt-dlp for video, gallery-dl for photos and carousels.
-   - Extract: YouTube's own captions when present. Otherwise speech-to-text: Parakeet-TDT v3 on Apple Silicon, which covers 25 European languages and makes up far less over music, with Whisper turbo for other languages. Whisper turbo alone elsewhere. The agent reads on-screen text from keyframes.
+   - Extract: YouTube's own captions when present. Otherwise speech-to-text through the user's own Deepgram (nova-3) or OpenAI (gpt-4o-transcribe) key, the Settings' provider first and the other as fallback ([ADR 0005](adr/0005-transcription-through-the-users-own-api-keys.md); it replaced the local Parakeet and Whisper engines). The agent reads on-screen text from keyframes.
    - Finish the Entry: the agent's analysis, a stored thumbnail (none in Sheets), then the media is deleted (a setting keeps it).
    - Dig up the run's quota of Buried Entries, newest first.
    - Last step: write the "Week of …" Digest.
@@ -59,7 +59,7 @@ Setup is a conversation on the computer, in the Code tab, after the plugin is ad
 2. Pick the Library; the agent creates it with its Settings.
 3. Pick the weekly day.
 4. Pick the browser you are logged in with.
-5. The agent installs the tools, asking first: uv, ffmpeg, yt-dlp, gallery-dl, Parakeet (on Apple Silicon) and Whisper.
+5. The agent installs the tools, asking first: uv, ffmpeg, yt-dlp and gallery-dl. The user puts their Deepgram and/or OpenAI key in the keys file in a text editor.
 6. Test one link end to end, and approve the Library tools with "always allow" so scheduled runs never stall.
 7. The agent saves the Library link to memory and creates the weekly task.
 8. On the phone: connect Notion or Sheets, and share a test link.

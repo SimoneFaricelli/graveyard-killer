@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import platform
+import json
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import Run
+from conftest import DEEPGRAM_KEY, OPENAI_KEY, Run
 
 REEL = "https://www.instagram.com/p/Rk3elTest01/"
 REEL_INFO = {
@@ -24,31 +24,11 @@ REEL_INFO = {
 }
 
 
-def whisper_calls(run: Run) -> list[list[str]]:
-    """Calls to either Whisper build; which one runs depends on the computer."""
-    return run.called("mlx_whisper") + run.called("whisper-ctranslate2")
-
-
-def speech_calls(run: Run) -> list[list[str]]:
-    return run.called("parakeet-mlx") + whisper_calls(run)
-
-
-apple_silicon = pytest.mark.skipif(
-    not (platform.system() == "Darwin" and platform.machine() == "arm64"),
-    reason="Parakeet runs only on Apple Silicon",
-)
-elsewhere = pytest.mark.skipif(
-    platform.system() == "Darwin" and platform.machine() == "arm64",
-    reason="off Apple Silicon, Whisper is the only engine",
-)
-
-
 def reel(media: dict[str, Path], **extra: Any) -> dict[str, Any]:
     return {
         "yt-dlp": [{"json": REEL_INFO, "media": str(media["scenes"]), "thumbnail": str(media["thumb"])}],
-        "parakeet-mlx": [{"text": "Three ways to cook chickpeas."}],
-        "mlx_whisper": [{"text": "Five things I would still do today.", "language": "en"}],
-        "whisper-ctranslate2": [{"text": "Five things I would still do today.", "language": "en"}],
+        "deepgram": [{"text": "Five things I would still do today.", "language": "en"}],
+        "openai": [{"text": "Three ways to cook chickpeas."}],
         **extra,
     }
 
@@ -69,42 +49,149 @@ def test_reading_a_reel_gives_its_canonical_link_author_and_caption(
     assert Path(run.output["work"]).is_dir()
 
 
-@elsewhere
-def test_speech_without_captions_is_transcribed_by_whisper(
-    post: Callable[..., Run], media: dict[str, Path]
-) -> None:
+def test_speech_without_captions_goes_to_deepgram_first(post: Callable[..., Run], media: dict[str, Path]) -> None:
     run = post("read", REEL, scenario=reel(media))
 
+    assert run.output["status"] == "ok"
     assert run.output["transcript"] == "Five things I would still do today."
-    assert run.output["transcript_source"] == "whisper"
+    assert run.output["transcript_source"] == "deepgram"
     assert run.output["transcript_language"] == "en"
+    [request] = run.asked("deepgram")
+    assert request.headers["Authorization"] == f"Token {DEEPGRAM_KEY}"
+    assert request.headers["Content-Type"] == "audio/mpeg"
+    assert request.query["model"] == "nova-3"
+    assert request.query["detect_language"] == "true"
+    assert "language" not in request.query
+    assert request.audio_bytes > 0
+    assert run.asked("openai") == []
 
 
-@apple_silicon
-@pytest.mark.parametrize("hint", [None, "it", "en"])
-def test_on_apple_silicon_parakeet_transcribes_its_own_languages(
-    post: Callable[..., Run], media: dict[str, Path], hint: str | None
-) -> None:
-    args = ("read", REEL, "--language", hint) if hint else ("read", REEL)
-    run = post(*args, scenario=reel(media))
+def test_the_provider_option_puts_openai_first(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, "--provider", "openai", "--language", "it", scenario=reel(media))
 
     assert run.output["transcript"] == "Three ways to cook chickpeas."
-    assert run.output["transcript_source"] == "parakeet"
-    assert run.output["transcript_language"] == hint
-    assert whisper_calls(run) == []
+    assert run.output["transcript_source"] == "openai"
+    assert run.output["transcript_language"] == "it"
+    [request] = run.asked("openai")
+    assert request.headers["Authorization"] == f"Bearer {OPENAI_KEY}"
+    assert request.fields == {"model": "gpt-4o-transcribe", "response_format": "json", "language": "it"}
+    assert request.audio_bytes > 0
+    assert run.asked("deepgram") == []
 
 
-@apple_silicon
-def test_on_apple_silicon_whisper_takes_languages_parakeet_lacks(
+@pytest.mark.parametrize("status", [500, 503, 401])
+def test_when_the_first_provider_fails_the_other_transcribes(
+    post: Callable[..., Run], media: dict[str, Path], status: int
+) -> None:
+    run = post("read", REEL, scenario=reel(media, deepgram=[{"status": status}]))
+
+    assert run.output["status"] == "ok"
+    assert run.output["transcript_source"] == "openai"
+    assert run.output["transcript"] == "Three ways to cook chickpeas."
+
+
+def test_a_missing_key_skips_that_provider_without_calling_it(
     post: Callable[..., Run], media: dict[str, Path]
 ) -> None:
-    run = post("read", REEL, "--language", "ja", scenario=reel(media))
+    run = post("read", REEL, scenario=reel(media), env={"DEEPGRAM_API_KEY": ""})
 
-    assert run.output["transcript_source"] == "whisper"
-    assert run.called("parakeet-mlx") == []
+    assert run.output["transcript_source"] == "openai"
+    assert run.asked("deepgram") == []
 
 
-def test_a_video_without_sound_has_no_transcript_and_skips_whisper(
+def test_keys_come_from_the_keys_file(post: Callable[..., Run], media: dict[str, Path], tmp_path: Path) -> None:
+    keys = tmp_path / "keys.env"
+    keys.write_text("# my keys\nexport DEEPGRAM_API_KEY='dg-from-file'\nOPENAI_API_KEY=\n")
+
+    run = post("read", REEL, scenario=reel(media), unset=("DEEPGRAM_API_KEY", "OPENAI_API_KEY"))
+
+    assert run.output["transcript_source"] == "deepgram"
+    assert run.asked("deepgram")[0].headers["Authorization"] == "Token dg-from-file"
+    assert run.asked("openai") == []
+
+
+def test_rate_limits_and_bad_keys_on_every_provider_block_transcription(
+    post: Callable[..., Run], media: dict[str, Path]
+) -> None:
+    run = post("read", REEL, scenario=reel(media, deepgram=[{"status": 401}], openai=[{"status": 429}]))
+
+    assert run.output["status"] == "transcription_failed"
+    assert run.output["blocked"] is True
+    assert run.output["reason"] == "deepgram: HTTP 401; openai: HTTP 429"
+    assert run.output["platform"] == "instagram"
+    assert Path(run.output["work"]).is_dir()
+    assert OPENAI_KEY[:6] not in run.output["reason"]
+
+
+def test_no_key_at_all_blocks_transcription_without_calling_anyone(
+    post: Callable[..., Run], media: dict[str, Path]
+) -> None:
+    run = post("read", REEL, scenario=reel(media), env={"DEEPGRAM_API_KEY": "", "OPENAI_API_KEY": ""})
+
+    assert run.output["status"] == "transcription_failed"
+    assert run.output["blocked"] is True
+    assert "no DEEPGRAM_API_KEY" in run.output["reason"]
+    assert run.requests == []
+
+
+def test_server_errors_on_every_provider_fail_but_do_not_block(
+    post: Callable[..., Run], media: dict[str, Path]
+) -> None:
+    run = post("read", REEL, scenario=reel(media, deepgram=[{"status": 401}], openai=[{"status": 500}]))
+
+    assert run.output["status"] == "transcription_failed"
+    assert run.output["blocked"] is False
+
+
+def test_an_unreachable_provider_falls_back(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, scenario=reel(media), env={"GK_DEEPGRAM_URL": "http://127.0.0.1:9"})
+
+    assert run.output["transcript_source"] == "openai"
+
+
+def test_empty_text_is_a_result_and_needs_no_fallback(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, scenario=reel(media, deepgram=[{"text": ""}]))
+
+    assert run.output["status"] == "ok"
+    assert run.output["transcript"] == ""
+    assert run.output["transcript_source"] == "deepgram"
+    assert run.output["transcript_blocks"] == []
+    assert run.asked("openai") == []
+
+
+def test_a_regional_language_hint_is_sent_as_its_base_code(
+    post: Callable[..., Run], media: dict[str, Path]
+) -> None:
+    run = post("read", REEL, "--language", "pt-BR", scenario=reel(media))
+
+    [request] = run.asked("deepgram")
+    assert request.query["language"] == "pt"
+    assert "detect_language" not in request.query
+
+
+def test_a_language_deepgram_refuses_is_retried_with_detection(
+    post: Callable[..., Run], media: dict[str, Path]
+) -> None:
+    run = post("read", REEL, "--language", "xx",
+               scenario=reel(media, deepgram=[{"status": 400}, {"text": "Ciao a tutti.", "language": "it"}]))
+
+    assert run.output["transcript"] == "Ciao a tutti."
+    assert run.output["transcript_language"] == "it"
+    first, second = run.asked("deepgram")
+    assert first.query["language"] == "xx"
+    assert second.query["detect_language"] == "true" and "language" not in second.query
+
+
+def test_long_audio_goes_to_openai_in_pieces(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, "--provider", "openai",
+               scenario=reel(media, openai=[{"text": "One."}, {"text": "Two."}, {"text": "Three."}]),
+               env={"GK_OPENAI_SEGMENT_SECONDS": "2"})
+
+    assert len(run.asked("openai")) >= 3
+    assert run.output["transcript"].startswith("One. Two. Three.")
+
+
+def test_a_video_without_sound_has_no_transcript_and_calls_no_provider(
     post: Callable[..., Run], media: dict[str, Path]
 ) -> None:
     scenario = reel(media)
@@ -114,7 +201,7 @@ def test_a_video_without_sound_has_no_transcript_and_skips_whisper(
 
     assert run.output["transcript"] is None
     assert run.output["transcript_source"] == "none"
-    assert speech_calls(run) == []
+    assert run.requests == []
 
 
 VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -146,13 +233,12 @@ def youtube(media: dict[str, Path], **info: Any) -> dict[str, Any]:
             {"json": {**VIDEO_INFO, **info}, "media": str(media["scenes"]), "thumbnail": str(media["thumb"])},
             {"subs": VTT},
         ],
-        "parakeet-mlx": [{"text": "parakeet text"}],
-        "mlx_whisper": [{"text": "whisper text", "language": "en"}],
-        "whisper-ctranslate2": [{"text": "whisper text", "language": "en"}],
+        "deepgram": [{"text": "deepgram text", "language": "en"}],
+        "openai": [{"text": "openai text"}],
     }
 
 
-def test_creator_captions_are_the_transcript_and_whisper_never_runs(
+def test_creator_captions_are_the_transcript_and_no_provider_is_called(
     post: Callable[..., Run], media: dict[str, Path]
 ) -> None:
     run = post("read", VIDEO, scenario=youtube(media, subtitles={"en": [{"ext": "vtt"}]}))
@@ -160,7 +246,7 @@ def test_creator_captions_are_the_transcript_and_whisper_never_runs(
     assert run.output["transcript"] == "Soak the chickpeas overnight then roast them for twenty minutes"
     assert run.output["transcript_source"] == "captions"
     assert run.output["transcript_language"] == "en"
-    assert speech_calls(run) == []
+    assert run.requests == []
 
 
 AUTO_VTT = """WEBVTT
@@ -176,7 +262,7 @@ until crisp
 """
 
 
-def test_original_language_automatic_captions_come_before_whisper(
+def test_original_language_automatic_captions_come_before_speech_to_text(
     post: Callable[..., Run], media: dict[str, Path]
 ) -> None:
     scenario = youtube(media, automatic_captions={"en-orig": [{"ext": "vtt"}], "it": [{"ext": "vtt"}]})
@@ -186,7 +272,7 @@ def test_original_language_automatic_captions_come_before_whisper(
 
     assert run.output["transcript"] == "roast the chickpeas until crisp"
     assert run.output["transcript_source"] == "auto_captions"
-    assert speech_calls(run) == []
+    assert run.requests == []
 
 
 ACCENTED_VTT = """WEBVTT
@@ -445,28 +531,20 @@ def test_gallery_dl_login_challenge_needs_login(post: Callable[..., Run], galler
     assert run.output["status"] == "needs_login"
 
 
-@pytest.mark.parametrize(
-    ("missing", "named"),
-    [(("yt-dlp",), "yt-dlp"), (("parakeet-mlx", "mlx_whisper", "whisper-ctranslate2"), "is not installed")],
-)
-def test_a_missing_tool_is_an_error_that_names_it(
-    post: Callable[..., Run], media: dict[str, Path], missing: tuple[str, ...], named: str
-) -> None:
-    run = post("read", REEL, scenario=reel(media), without=missing)
+def test_a_missing_tool_is_an_error_that_names_it(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, scenario=reel(media), without=("yt-dlp",))
 
     assert run.output["status"] == "error"
-    assert named in run.output["reason"]
+    assert "yt-dlp" in run.output["reason"]
 
 
 def test_a_tool_that_fails_midway_is_an_error(post: Callable[..., Run], media: dict[str, Path]) -> None:
     scenario = reel(media)
-    failing = [{"exit": 1, "stderr": "Error: model load failed"}]
-    scenario["parakeet-mlx"] = scenario["mlx_whisper"] = scenario["whisper-ctranslate2"] = failing
+    scenario["yt-dlp"][0]["json"] = "not json"
 
     run = post("read", REEL, scenario=scenario)
 
     assert run.output["status"] == "error"
-    assert "model load failed" in run.output["reason"]
 
 
 def test_check_passes_when_every_tool_is_there(post: Callable[..., Run]) -> None:
@@ -483,31 +561,39 @@ def test_check_asks_for_uv_which_installs_the_other_tools(post: Callable[..., Ru
     assert "astral.sh/uv" in missing["uv"]
 
 
-@apple_silicon
-def test_check_asks_for_parakeet_on_apple_silicon(post: Callable[..., Run]) -> None:
-    run = post("check", without=("parakeet-mlx",))
+def test_check_reports_which_keys_are_set(post: Callable[..., Run], tmp_path: Path) -> None:
+    run = post("check")
 
-    missing = {m["tool"]: m["install"] for m in run.output["missing"]}
-    assert missing["parakeet"] == "uv tool install parakeet-mlx"
+    assert run.output["keys"] == {"deepgram": True, "openai": True}
+    assert run.output["warnings"] == []
+    assert run.output["keys_file"] == str(tmp_path / "keys.env")
 
 
-@apple_silicon
-def test_check_says_whether_the_speech_model_is_downloaded(post: Callable[..., Run], tmp_path: Path) -> None:
-    hf_home = tmp_path / "hf"
-    assert post("check", env={"HF_HOME": str(hf_home)}).output["speech_model"] == "not downloaded"
+def test_check_warns_when_only_the_other_provider_has_a_key(post: Callable[..., Run]) -> None:
+    run = post("check", "--provider", "openai", env={"OPENAI_API_KEY": ""})
 
-    (hf_home / "hub" / "models--mlx-community--parakeet-tdt-0.6b-v3").mkdir(parents=True)
-    assert post("check", env={"HF_HOME": str(hf_home)}).output["speech_model"] == "downloaded"
+    assert run.output["ok"] is True
+    assert run.output["keys"] == {"deepgram": True, "openai": False}
+    assert "deepgram transcribes instead" in run.output["warnings"][0]
+
+
+def test_check_fails_with_no_key_at_all(post: Callable[..., Run], tmp_path: Path) -> None:
+    run = post("check", env={"DEEPGRAM_API_KEY": "", "OPENAI_API_KEY": ""})
+
+    assert run.output["ok"] is False
+    [missing] = run.output["missing"]
+    assert missing["tool"] == "speech-to-text API key"
+    assert str(tmp_path / "keys.env") in missing["install"]
+    assert DEEPGRAM_KEY not in json.dumps(run.output)
 
 
 def test_check_lists_each_missing_tool_with_its_install_command(post: Callable[..., Run]) -> None:
-    run = post("check", without=("gallery-dl", "ffmpeg", "mlx_whisper", "whisper-ctranslate2"))
+    run = post("check", without=("gallery-dl", "ffmpeg"))
 
     assert run.output["ok"] is False
     missing = {m["tool"]: m["install"] for m in run.output["missing"]}
-    assert missing.keys() == {"gallery-dl", "ffmpeg", "whisper"}
+    assert missing.keys() == {"gallery-dl", "ffmpeg"}
     assert missing["gallery-dl"] == "uv tool install gallery-dl"
-    assert "whisper" in missing["whisper"] and missing["whisper"].startswith("uv tool install")
     assert "ffmpeg" in missing["ffmpeg"].lower()  # winget's id is Gyan.FFmpeg
 
 
@@ -533,13 +619,11 @@ def test_clean_refuses_a_folder_that_read_did_not_make(post: Callable[..., Run],
     assert (precious / "notes.txt").exists()
 
 
-def test_a_language_hint_parakeet_lacks_reaches_whisper(post: Callable[..., Run], media: dict[str, Path]) -> None:
-    run = post("read", REEL, "--language", "ja", scenario=reel(media))
+def test_a_language_hint_reaches_openai(post: Callable[..., Run], media: dict[str, Path]) -> None:
+    run = post("read", REEL, "--provider", "openai", "--language", "ja", scenario=reel(media))
 
-    calls = whisper_calls(run)
-    assert len(calls) == 1
-    argv = calls[0]
-    assert argv[argv.index("--language") + 1] == "ja"
+    [request] = run.asked("openai")
+    assert request.fields["language"] == "ja"
 
 
 def test_the_link_can_arrive_on_stdin(post: Callable[..., Run], media: dict[str, Path]) -> None:
@@ -641,10 +725,7 @@ def test_a_long_transcript_comes_in_blocks_that_fit_notion(
     post: Callable[..., Run], media: dict[str, Path]
 ) -> None:
     sentence = "Soak the chickpeas overnight, then roast them until they are crisp. "
-    scenario = reel(media)
-    scenario["parakeet-mlx"] = scenario["mlx_whisper"] = scenario["whisper-ctranslate2"] = [
-        {"text": sentence * 100, "language": "en"}
-    ]
+    scenario = reel(media, deepgram=[{"text": sentence * 100, "language": "en"}])
 
     run = post("read", REEL, scenario=scenario)
 

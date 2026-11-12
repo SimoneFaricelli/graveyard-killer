@@ -18,6 +18,8 @@ Done when you hold the three parts below, each of them possibly empty.
 2. **Fixes:** what only the user can solve.
    - Missing tools, with their install commands.
    - Instagram asked for a login, and how many Instagram Entries wait for the next run.
+   - Transcription is blocked: say which provider refused and why, from the `reason` (no key, a key refused, no credit left, a rate limit), that the user fixes it in their Deepgram or OpenAI account or in the keys file, and how many Entries wait for the next run.
+   - The `warnings` from the tools check, such as the chosen provider's key missing.
    - Entries this run left with a new Note, in the Inbox or Buried. An Entry that fails again with the Note it already had is not news: it waits for the Digest's Needs you list, so that one dead link does not ping the user every day.
    - Duplicates this run found: Entries whose Note it set to "Duplicate of". Ask whether to move them to the Notion trash.
    - A scheduled run whose prompt is from before version 0.4.0 (it calls the run "unattended"): ask the user to say "update my Graveyard Killer schedule" in the Code tab, which also makes the run daily.

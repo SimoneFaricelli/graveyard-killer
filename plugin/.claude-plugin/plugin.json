@@ -1,12 +1,12 @@
 {
   "name": "graveyard-killer",
-  "description": "Send a post from Instagram, TikTok or YouTube to your agent. It files what the post says in your own Notion Library. No server, no API keys.",
-  "version": "0.4.3",
+  "description": "Send a post from Instagram, TikTok or YouTube to your agent. It files what the post says in your own Notion Library. No server; speech is transcribed with your own Deepgram or OpenAI key.",
+  "version": "0.5.0",
   "author": {
     "name": "Graveyard Killer contributors"
   },
-  "homepage": "https://github.com/andreadorizza/graveyard-killer",
-  "repository": "https://github.com/andreadorizza/graveyard-killer",
+  "homepage": "https://github.com/SimoneFaricelli/graveyard-killer",
+  "repository": "https://github.com/SimoneFaricelli/graveyard-killer",
   "license": "MIT",
   "skills": "./skills/"
 }

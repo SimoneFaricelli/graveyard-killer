@@ -8,10 +8,11 @@ You came here from the `graveyard-killer-worker` skill, or from Setup or Recall 
 
 ## Steps
 
-1. **Check the tools.** Run `python3 scripts/post.py check`. Done when it prints `"ok": true`, or the missing tools are in the Ping.
+1. **Check the tools and keys.** Run `python3 scripts/post.py check --provider <provider>`, where `<provider>` is the Provider in the Settings' Transcription section (`deepgram` when missing). Done when it prints `"ok": true`, or the missing tools are in the Ping.
    - If tools are missing in a scheduled run, put them in the Ping with the `install` commands it prints, and go to step 6.
    - Otherwise tell the user which tools are missing, with those commands, and ask once. On a yes, run each install command in the order given, then run `check` again. On a no, stop.
-   - If `speech_model` is `"not downloaded"`, say that the first video downloads the speech model once, over 1 GB, so it takes longer. In a scheduled run, say it in the Ping's first line, if there is a Ping.
+   - A missing `speech-to-text API key` is never yours to install: the user adds a key to the `keys_file` it names, in a text editor. Never ask for a key in the chat, and never write one to a file or a command yourself. Put it in the Ping (or, when the user is here, tell them) and go to step 6.
+   - Each line in `warnings`, such as the chosen provider's key missing, goes in the Ping's fixes. The run carries on with the other provider.
 
 2. **Set the budget.** Done when you hold this run's budget and know whether Dig up is on.
    - **Downloads.** Count the Entries whose Platform is not Other and whose Processed date is today, and those whose Processed date falls in the last 7 days, today included. Processed is set on every Entry the Worker finished, Unavailable ones included. The budget is the smaller of "Downloads per day" minus today's count and "Downloads per week" minus the week's count, from the Settings' Limits (20 and 100 when missing). Below zero counts as zero.
@@ -59,12 +60,13 @@ An article or any other page has no media to read. If its Summary is empty, read
    LINK
    ```
 
-   When the Entry's Caption is clearly in one language, add its language code as a hint, such as `read --language it <<'LINK'`, so that the right speech engine runs. Done when the script has printed one JSON object. Keep its `work` path for step 4.
+   Always add `--provider <provider>` from step 1, such as `read --provider deepgram <<'LINK'`. When the Entry's Caption is clearly in one language, also add its language code as a hint, such as `--language it`, so that the speech is transcribed in that language. Done when the script has printed one JSON object. Keep its `work` path for step 4.
 
 3. **Act on its `status`.** Done when the Entry has its result:
    - `ok`: if its `link` differs from the Entry's Link, [merge a duplicate](#merge-a-duplicate) first. Otherwise, [finish the Entry](#finish-the-entry).
    - `unavailable`: set Status to the Library's label for Unavailable, set Processed to today, and remove the ⏳ from the Title. Set the Note to the `reason`, said in the Settings language. Change nothing else.
    - `needs_login` on Instagram: Instagram challenged the run. Leave the Entry's Status as it is, Inbox or Buried, and set its Note to say that Instagram asked for a login and the next run will retry. Read no more Instagram Entries in this run, and leave them as they are. TikTok and YouTube Entries carry on, since the risk is Instagram's.
+   - `transcription_failed`: the post was downloaded but no speech-to-text provider could transcribe it. Leave the Entry's Status as it is, Inbox or Buried, and set its Note to say the transcription failed and the next run will retry, with the `reason`. When `blocked` is true, the keys are missing or refused, or the credit or rate limit ran out: read no more Instagram, TikTok or YouTube Entries in this run, so the download budget is not spent on posts that cannot be finished, and leave them as they are. When `blocked` is false, go on with the next Entry.
    - `needs_login` on another platform, or `error`: leave the Entry's Status as it is, set the Note to the `reason`, said in the Settings language, and go on.
 
 4. **Clean up,** whatever the result, when `work` is not null:

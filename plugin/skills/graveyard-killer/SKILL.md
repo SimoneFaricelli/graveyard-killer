@@ -5,7 +5,7 @@ description: Capture a shared post into the user's Graveyard Killer Library, and
 
 # Graveyard Killer
 
-Graveyard Killer files the posts a user sends you into their own **Library**, a Notion page they own. Each post becomes one **Entry**. You do the work through the user's own connectors: there is no server and no API key.
+Graveyard Killer files the posts a user sends you into their own **Library**, a Notion page they own. Each post becomes one **Entry**. You do the work through the user's own connectors: there is no server. The only API keys are the user's own speech-to-text keys (Deepgram or OpenAI), which the Worker's post script reads from a file on the user's computer.
 
 The scripts in this skill run with `python3`. On Windows, `python3` can be the Microsoft Store's placeholder, which prints "Python was not found" and exits with code 49. Then use `py -3` in its place for every script.
 

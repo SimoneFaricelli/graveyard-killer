@@ -1,11 +1,12 @@
 """Read one post for the Worker: a link in, one JSON object and files out.
 
-    post.py check                    which tools are missing, and how to install them
-    post.py read [<link>] [--language <code>]   the link comes on stdin when left out
+    post.py check [--provider <name>]   which tools and API keys are missing, and how to add them
+    post.py read [<link>] [--language <code>] [--provider <name>]   the link comes on stdin when left out
     post.py clean <folder>           delete a work folder that read made
 
-Calls yt-dlp, gallery-dl, ffmpeg, ffprobe, Parakeet and Whisper as outside
-programs found on PATH. Standard library only.
+Calls yt-dlp, gallery-dl, ffmpeg and ffprobe as outside programs found on PATH.
+Speech goes to the user's own speech-to-text provider, Deepgram or OpenAI, with the
+user's API key from the environment or from the keys file. Standard library only.
 
 The caption choice, the keyframe sampling, the work-folder clean-up and the
 update-and-retry on a 403 follow claude-video's /watch skill (MIT,
@@ -23,9 +24,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
-from platform import machine, system
+from platform import system
 from typing import Any, TypeVar
 
 from link import parse as parse_link
@@ -54,12 +58,23 @@ FRAME_SIZE = 1024  # px: frames fit in a square this size
 SCENE_THRESHOLD = 0.3
 # Mean difference per colour channel (0-255) below which two 16x16 thumbnails count as the same frame.
 DUPLICATE_DIFFERENCE = 10
+PROVIDERS = ("deepgram", "openai")
+KEY_NAMES = {"deepgram": "DEEPGRAM_API_KEY", "openai": "OPENAI_API_KEY"}
+DEEPGRAM_MODEL = "nova-3"
+OPENAI_MODEL = "gpt-4o-transcribe"
+HTTP_TIMEOUT = 300  # seconds per request
+# OpenAI caps each request's audio length and output, so long audio goes in pieces.
+OPENAI_SEGMENT_SECONDS = 600
+# HTTP statuses that a retry next run will not fix: a bad key, no credit, or a rate limit.
+BLOCKING_STATUSES = (401, 402, 403, 429)
 
 
-def check() -> dict[str, Any]:
+def check(provider: str = PROVIDERS[0]) -> dict[str, Any]:
     """Which tools are missing, each with the command that installs it on this computer.
 
-    Also says whether the first-choice speech model is downloaded yet: it is over 1 GB.
+    Also says which speech-to-text API keys are set. With no key at all nothing can be
+    transcribed, so that counts as missing; with only the other provider's key, read
+    falls back to it, and a warning says so.
     """
     ffmpeg_install = {"Darwin": "brew install ffmpeg",
                       "Windows": "winget install --id Gyan.FFmpeg --exact"}.get(system(), "sudo apt install ffmpeg")
@@ -71,13 +86,22 @@ def check() -> dict[str, Any]:
         ("gallery-dl", "gallery-dl", "uv tool install gallery-dl"),
         ("ffmpeg", "ffmpeg", ffmpeg_install),
         ("ffprobe", "ffmpeg", ffmpeg_install),  # ffprobe ships with ffmpeg
-        *((engine.program, engine.name, f"uv tool install {engine.package}") for engine in engines()),
     ]
     missing: list[dict[str, str]] = []
     for program, name, install in needed:
         if not shutil.which(program) and all(m["tool"] != name for m in missing):
             missing.append({"tool": name, "install": install})
-    return {"ok": not missing, "missing": missing, "speech_model": speech_model(engines()[0])}
+    keys = {name: api_key(name) is not None for name in PROVIDERS}
+    warnings: list[str] = []
+    if not any(keys.values()):
+        missing.append({"tool": "speech-to-text API key",
+                        "install": f"add {KEY_NAMES['deepgram']}=... or {KEY_NAMES['openai']}=... "
+                                   f"to {keys_file()}"})
+    elif not keys[provider]:
+        other = next(name for name in PROVIDERS if keys[name])
+        warnings.append(f"no {KEY_NAMES[provider]} in {keys_file()}, so {other} transcribes instead")
+    return {"ok": not missing, "missing": missing, "keys": keys, "keys_file": str(keys_file()),
+            "warnings": warnings}
 
 
 def clean(folder: Path) -> dict[str, Any]:
@@ -88,58 +112,30 @@ def clean(folder: Path) -> dict[str, Any]:
     return {"cleaned": str(folder)}
 
 
-@dataclass(frozen=True)
-class Engine:
-    """One speech-to-text program: how results name it, how to run it, and how to install it."""
-
-    name: str  # "parakeet" or "whisper", as transcript_source reports it
-    program: str
-    package: str
-    options: tuple[str, ...]  # model and JSON output; the output folder comes last
-    model_cache: str | None  # Hugging Face cache folder of its model, when known
+def keys_file() -> Path:
+    """Where the API keys live: a file, since a scheduled run does not get the shell's environment."""
+    return Path(os.environ.get("GK_KEYS_FILE") or Path.home() / ".config" / "graveyard-killer" / "keys.env")
 
 
-PARAKEET = Engine("parakeet", "parakeet-mlx", "parakeet-mlx",
-                  ("--model", "mlx-community/parakeet-tdt-0.6b-v3", "--output-format", "json", "--output-dir"),
-                  "models--mlx-community--parakeet-tdt-0.6b-v3")
-MLX_WHISPER = Engine("whisper", "mlx_whisper", "mlx-whisper",
-                     ("--model", "mlx-community/whisper-large-v3-turbo", "--output-format", "json",
-                      "--output-dir"),
-                     "models--mlx-community--whisper-large-v3-turbo")
-CT2_WHISPER = Engine("whisper", "whisper-ctranslate2", "whisper-ctranslate2",
-                     ("--model", "large-v3-turbo", "--output_format", "json", "--output_dir"),
-                     None)
-# Parakeet-TDT v3's 25 European languages, as ISO 639-1 codes.
-PARAKEET_LANGUAGES = {"bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it",
-                      "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk"}
-
-
-def engines() -> list[Engine]:
-    """The engines this computer needs, first choice first.
-
-    On Apple Silicon, Parakeet: faster than Whisper and much less prone to writing
-    words over music or silence. Whisper turbo covers the languages Parakeet lacks.
-    Elsewhere, Whisper turbo alone.
-    """
-    if system() == "Darwin" and machine() == "arm64":
-        return [PARAKEET, MLX_WHISPER]
-    return [CT2_WHISPER]
-
-
-def engine_for(language: str | None) -> Engine:
-    """Parakeet for its own languages and for an unknown one; Whisper for any other."""
-    first = engines()[0]
-    if first is PARAKEET and (language is None or language.split("-")[0].lower() in PARAKEET_LANGUAGES):
-        return PARAKEET
-    return engines()[-1]
-
-
-def speech_model(engine: Engine) -> str:
-    if engine.model_cache is None:
-        return "unknown"
-    cache = os.environ.get("HF_HUB_CACHE") or Path(
-        os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
-    return "downloaded" if (Path(cache) / engine.model_cache).is_dir() else "not downloaded"
+def api_key(provider: str) -> str | None:
+    """The provider's key: the environment first, then the keys file. Empty counts as missing."""
+    name = KEY_NAMES[provider]
+    value = os.environ.get(name)
+    if value is None:
+        try:
+            lines = keys_file().read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, found = line.partition("=")
+            if key.strip() == name:
+                value = found.strip().strip('"').strip("'")
+    return value.strip() if value and value.strip() else None
 
 
 def missing_tools() -> str:
@@ -148,19 +144,22 @@ def missing_tools() -> str:
     Windows leaves FileNotFoundError.filename empty, so the name comes from a lookup.
     It only looks for .exe files, the only kind post.py starts on Windows, and runs nothing.
     """
-    names = ["yt-dlp", "gallery-dl", "ffmpeg", "ffprobe", *(engine.program for engine in engines())]
+    names = ["yt-dlp", "gallery-dl", "ffmpeg", "ffprobe"]
     suffix = ".exe" if system() == "Windows" else ""
     gone = [name for name in names if not shutil.which(name + suffix)]
     return ", ".join(gone) or "a tool"
 
 
-def read(link: str, language: str | None = None) -> dict[str, Any]:
+def read(link: str, language: str | None = None, provider: str = PROVIDERS[0]) -> dict[str, Any]:
     if not WEB_LINK.match(link):
         # Refused before any tool runs: a "link" such as "--exec=..." would be read as an option.
         return {"status": "error", "reason": "not a web link", "link": link, "work": None}
     folder = new_work_folder()
     try:
-        return read_post(link, folder, language)
+        return read_post(link, folder, language, provider)
+    except TranscriptionFailed as failed:
+        return {**not_ok(link, folder, ""), "status": "transcription_failed", "reason": failed.reason,
+                "blocked": failed.blocked}
     except FileNotFoundError as missing:
         return not_ok(link, folder, f"{missing.filename or missing_tools()} is not installed")
     except subprocess.CalledProcessError as broken:
@@ -172,7 +171,7 @@ def read(link: str, language: str | None = None) -> dict[str, Any]:
         return not_ok(link, folder, f"{type(unexpected).__name__}: {unexpected}")
 
 
-def read_post(link: str, folder: Path, language: str | None) -> dict[str, Any]:
+def read_post(link: str, folder: Path, language: str | None, provider: str) -> dict[str, Any]:
     downloaded = download(link, folder)
     if downloaded.returncode != 0 and "http error 403" in last_error(downloaded.stderr).lower():
         # Sites often break older yt-dlp releases: update once, then retry once.
@@ -185,10 +184,11 @@ def read_post(link: str, folder: Path, language: str | None) -> dict[str, Any]:
     info = json.loads(downloaded.stdout)
     if info.get("_type") in ("playlist", "multi_video"):
         return read_photos(info.get("webpage_url") or link, folder)
-    return read_video(link, info, folder, language)
+    return read_video(link, info, folder, language, provider)
 
 
-def read_video(link: str, info: dict[str, Any], folder: Path, hint: str | None) -> dict[str, Any]:
+def read_video(link: str, info: dict[str, Any], folder: Path, hint: str | None,
+               provider: str) -> dict[str, Any]:
     canonical = parse_link(info.get("webpage_url") or link)
     media = Path(info["requested_downloads"][0]["filepath"])
     transcript, source, language = None, "none", None
@@ -197,7 +197,8 @@ def read_video(link: str, info: dict[str, Any], folder: Path, hint: str | None) 
         key, source = track
         transcript, language = captions(info["webpage_url"], key, source, folder), info["language"]
     elif has_audio(media):
-        transcript, language, source = transcribe(media, folder / "transcript", hint or info.get("language"))
+        transcript, language, source = transcribe(media, folder / "transcript", hint or info.get("language"),
+                                                  provider)
     frames = keyframes(media, folder / "frames")
     return ok(
         canonical, folder, "video", frames, thumbnail(folder / "media.jpg", frames, folder / "thumbnail.jpg"),
@@ -519,16 +520,129 @@ def has_audio(media: Path) -> bool:
     return bool(probe.stdout.strip())
 
 
-def transcribe(media: Path, out_dir: Path, language: str | None) -> tuple[str, str | None, str]:
-    """The speech in media, the language it is in when known, and the engine's name."""
+class TranscriptionFailed(Exception):
+    """Every provider failed. blocked: each failure was one a retry will not fix (key, credit, rate)."""
+
+    def __init__(self, reason: str, blocked: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.blocked = blocked
+
+
+class ProviderError(Exception):
+    """One provider's failure, said without the key: an HTTP status, or why the call never got one."""
+
+    def __init__(self, reason: str, status: int | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+def transcribe(media: Path, out_dir: Path, language: str | None,
+               provider: str = PROVIDERS[0]) -> tuple[str, str | None, str]:
+    """The speech in media, the language it is in when known, and the provider's name.
+
+    The chosen provider first, then the other one. Empty text is a result (music only),
+    not a failure. Raises TranscriptionFailed when every provider fails.
+    """
     out_dir.mkdir()
-    engine = engine_for(language)
-    command = [engine.program, str(media), *engine.options, str(out_dir)]
-    if language and engine.name == "whisper":  # Parakeet takes no language option
-        command += ["--language", language]
-    subprocess.run(command, capture_output=True, text=True, check=True)
-    result = json.loads((out_dir / f"{media.stem}.json").read_text(encoding="utf-8"))
-    return str(result.get("text", "")).strip(), result.get("language") or language, engine.name
+    audio = out_dir / "audio.mp3"
+    run_ffmpeg("-i", str(media), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio))
+    code = language.replace("_", "-").split("-")[0].lower() if language else None
+    order = [provider, *(name for name in PROVIDERS if name != provider)]
+    failures: list[str] = []
+    blocked = True
+    for name in order:
+        key = api_key(name)
+        if key is None:
+            failures.append(f"{name}: no {KEY_NAMES[name]}")
+            continue
+        try:
+            if name == "deepgram":
+                text, found = deepgram(audio, code, key)
+            else:
+                text, found = openai(audio, out_dir, code, key)
+        except ProviderError as failed:
+            failures.append(f"{name}: {failed.reason}")
+            blocked = blocked and failed.status in BLOCKING_STATUSES
+            continue
+        return text.strip(), found or code, name
+    raise TranscriptionFailed("; ".join(failures), blocked)
+
+
+def deepgram(audio: Path, language: str | None, key: str) -> tuple[str, str | None]:
+    """Deepgram's pre-recorded API. A language it refuses (HTTP 400) is retried once with detection."""
+    base = os.environ.get("GK_DEEPGRAM_URL") or "https://api.deepgram.com"
+    headers = {"Authorization": f"Token {key}", "Content-Type": "audio/mpeg"}
+    body = audio.read_bytes()
+    query = {"model": DEEPGRAM_MODEL, "smart_format": "true"}
+    try:
+        result = http_post(f"{base}/v1/listen?" + urllib.parse.urlencode(
+            {**query, **({"language": language} if language else {"detect_language": "true"})}), body, headers)
+    except ProviderError as failed:
+        if failed.status != 400 or not language:
+            raise
+        result = http_post(f"{base}/v1/listen?" + urllib.parse.urlencode({**query, "detect_language": "true"}),
+                           body, headers)
+    try:
+        channel = result["results"]["channels"][0]
+        text = str(channel["alternatives"][0]["transcript"])
+    except (KeyError, IndexError, TypeError):
+        raise ProviderError("unexpected response") from None
+    detected = channel.get("detected_language")
+    return text, str(detected) if detected else language
+
+
+def openai(audio: Path, out_dir: Path, language: str | None, key: str) -> tuple[str, str | None]:
+    """OpenAI's transcription API, one request per piece of at most OPENAI_SEGMENT_SECONDS."""
+    base = os.environ.get("GK_OPENAI_URL") or "https://api.openai.com"
+    seconds = int(os.environ.get("GK_OPENAI_SEGMENT_SECONDS") or OPENAI_SEGMENT_SECONDS)
+    pieces = [audio]
+    if duration_of(audio) > seconds:
+        parts = out_dir / "parts"
+        parts.mkdir()
+        run_ffmpeg("-i", str(audio), "-f", "segment", "-segment_time", str(seconds), "-c", "copy",
+                   str(parts / "%03d.mp3"))
+        pieces = sorted(parts.glob("*.mp3")) or [audio]
+    texts: list[str] = []
+    for piece in pieces:
+        fields = {"model": OPENAI_MODEL, "response_format": "json", **({"language": language} if language else {})}
+        body, content_type = multipart(fields, piece)
+        result = http_post(f"{base}/v1/audio/transcriptions", body,
+                           {"Authorization": f"Bearer {key}", "Content-Type": content_type})
+        if not isinstance(result.get("text"), str):
+            raise ProviderError("unexpected response")
+        texts.append(result["text"].strip())
+    return " ".join(t for t in texts if t), language
+
+
+def multipart(fields: dict[str, str], file: Path) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        for name, value in fields.items()
+    )
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{file.name}"\r\n'
+             "Content-Type: audio/mpeg\r\n\r\n").encode() + file.read_bytes() + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def http_post(url: str, body: bytes, headers: dict[str, str]) -> dict[str, Any]:
+    """POST and parse the JSON answer. Errors name the status only: some echo part of the key."""
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            answer = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as failed:
+        raise ProviderError(f"HTTP {failed.code}", failed.code) from None
+    except (urllib.error.URLError, TimeoutError, OSError) as failed:
+        raise ProviderError(f"no answer ({type(failed).__name__})") from None
+    except ValueError:
+        raise ProviderError("unexpected response") from None
+    if not isinstance(answer, dict):
+        raise ProviderError("unexpected response")
+    return answer
 
 
 def author_of(info: dict[str, Any], platform: str) -> str | None:
@@ -551,12 +665,15 @@ def main() -> None:
     read_parser = commands.add_parser("read")
     read_parser.add_argument("link", nargs="?", help="the Entry's Link; read from stdin when left out")
     read_parser.add_argument("--language", help="the spoken language when known, such as it")
-    commands.add_parser("check")
+    read_parser.add_argument("--provider", choices=PROVIDERS, default=PROVIDERS[0],
+                             help="the speech-to-text provider to try first; the other is the fallback")
+    check_parser = commands.add_parser("check")
+    check_parser.add_argument("--provider", choices=PROVIDERS, default=PROVIDERS[0])
     clean_parser = commands.add_parser("clean")
     clean_parser.add_argument("folder", type=Path)
     args = parser.parse_args()
     if args.command == "check":
-        print(json.dumps(check()))
+        print(json.dumps(check(args.provider)))
     elif args.command == "clean":
         result = clean(args.folder)
         print(json.dumps(result))
@@ -564,7 +681,7 @@ def main() -> None:
             sys.exit(2)
     else:
         link = args.link if args.link is not None else sys.stdin.read().strip()
-        print(json.dumps(read(link, args.language)))
+        print(json.dumps(read(link, args.language, args.provider)))
 
 
 if __name__ == "__main__":
