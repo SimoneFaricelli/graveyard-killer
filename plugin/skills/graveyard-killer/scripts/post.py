@@ -65,7 +65,8 @@ OPENAI_MODEL = "gpt-4o-transcribe"
 HTTP_TIMEOUT = 300  # seconds per request
 # OpenAI caps each request's output: on dense Italian speech, gpt-4o-transcribe dropped the
 # last 2 minutes of every 10-minute piece, and nothing of 5-minute pieces (live test, 2026-11-12).
-OPENAI_SEGMENT_SECONDS = 300
+# 3 minutes leaves room for faster speech; the price is per minute, so more pieces cost nothing.
+OPENAI_SEGMENT_SECONDS = 180
 # HTTP statuses that a retry next run will not fix: a bad key, no credit, or a rate limit.
 BLOCKING_STATUSES = (401, 402, 403, 429)
 

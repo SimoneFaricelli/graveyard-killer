@@ -23,7 +23,7 @@ Your saved posts are a graveyard. Graveyard Killer turns them into a Library in 
 ## Install
 
 1. In Claude Desktop, open *Customize → Plugins → Add marketplace* and paste `https://github.com/SimoneFaricelli/graveyard-killer`. If the original Graveyard Killer is installed, remove it first.
-2. Find **Graveyard Killer** under *Discover* and add it. Adding the marketplace alone is not enough.
+2. Find **Graveyard Killer** under *Discover* and add it. Adding the marketplace alone is not enough. In Claude Code, one line does both: `/plugin install graveyard-killer --marketplace SimoneFaricelli/graveyard-killer`.
 3. In the Code tab, open a session in an empty folder and type `Set up Graveyard Killer`. Setup asks what you save, creates the Library in your Notion, schedules the daily run, tests one post end to end and shows you how to save from the phone.
 
 To get a new version, open *Customize → Plugins* and choose *Check for updates* on this marketplace.

@@ -21,7 +21,7 @@ Setup starts when the user asks to set up Graveyard Killer, or when a Graveyard 
 
 4. **Install the tools and add the speech-to-text keys.** Done when `check` prints `"ok": true` and `keys` is true for the provider they picked.
    - Ask which provider should transcribe first, Deepgram or OpenAI; the other is the fallback when it fails. Write the answer to the Settings' Transcription Provider, `deepgram` or `openai`.
-   - Follow step 1 of [worker.md](worker.md#steps) for the tools.
+   - Follow step 1 of [worker.md](worker.md#steps) for the tools only. Here, a missing `speech-to-text API key` is expected: skip that entry and carry on with this step, which adds the key.
    - Run `python3 scripts/post.py check` and read its `keys_file`. If that file does not exist yet, create it with these two lines and nothing else, and on macOS and Linux run `chmod 600` on it:
 
      ```
